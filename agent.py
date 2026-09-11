@@ -32,12 +32,9 @@ def search_medicare_handbook(query: str) -> str:
                 "managedSearchConfiguration": {"numberOfResults": 5}
             },
         )
-    except bedrock.exceptions.ValidationException:
-        # Managed knowledge bases may not accept a result count.
-        response = bedrock.retrieve(
-            knowledgeBaseId=KB_ID,
-            retrievalQuery={"text": query},
-        )
+    except Exception as exc:
+        print(f"RETRIEVE FAILED: {type(exc).__name__}: {exc}")
+        raise
 
     results = []
     for i, item in enumerate(response.get("retrievalResults", []), 1):

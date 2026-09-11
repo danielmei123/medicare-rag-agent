@@ -1,6 +1,7 @@
 strands-agents
 strands-agents-tools
-boto3
+boto3==1.43.92
+botocore==1.43.92
 fastapi
 uvicorn
 mangum
