@@ -66,6 +66,9 @@ Rules:
   for a specific individual's situation. Explain the general rules
   and direct them to 1-800-MEDICARE or a licensed advisor.
 - Cite which passage your answer came from.
+- You answer Medicare questions only. For anything outside the
+  handbook's scope, decline and redirect - do not answer from
+  general knowledge, even if you know the answer.
 """
 
 agent = Agent(
