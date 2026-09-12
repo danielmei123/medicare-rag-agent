@@ -51,7 +51,7 @@ Bedrock Knowledge Base (managed, 128-page handbook)
 
 | Component | Choice | Reason |
 |---|---|---|
-| Agent framework | Strands (deployed), LangGraph (comparison) | See Two frameworks below |
+| Agent framework | Strands (deployed), LangGraph (comparison and orchestration) | See Two frameworks below |
 | Model | `us.anthropic.claude-sonnet-4-6` | Cross-region inference profile; on-demand throughput is not supported for the bare model ID |
 | Retrieval | Bedrock Knowledge Base, managed storage | No vector store to operate for a prototype |
 | Hosting | Lambda container image; also EKS | 75+ dependencies exceed the zip limit; scales to zero between requests |
@@ -63,6 +63,7 @@ Bedrock Knowledge Base (managed, 128-page handbook)
 |---|---|
 | `agent.py` | The agent: retrieval tool, system prompt, agent construction |
 | `agent_langgraph.py` | The same agent as an explicit LangGraph state graph |
+| `agent_orchestrator.py` | Multi-agent version: orchestrator routing to specialist agents |
 | `app.py` | FastAPI wrapper and the single-page front end |
 | `lambda_handler.py` | Lambda entry point via Mangum |
 | `Dockerfile` | Lambda container image |
@@ -90,8 +91,37 @@ inspect and modify, and the cost is that failure handling inside nodes is
 your responsibility.
 
 For a single-tool agent, Strands is the simpler fit. LangGraph earns its
-complexity when the graph needs branching, cycles, or checkpoints —
-multi-agent routing, for instance.
+complexity when the graph needs branching — which is what the orchestrator
+below uses it for.
+
+## Multi-agent orchestration
+
+`agent_orchestrator.py` implements two patterns the single-agent version
+does not need: specialists exposed as tools, and an orchestrator that
+routes rather than answers.
+
+The specialists differ in capability rather than just in prompt. The
+eligibility specialist has a deterministic date calculator alongside
+retrieval, so enrollment windows are computed rather than reasoned about —
+including the rule that a first-of-month birthday shifts the whole
+seven-month window one month earlier. The costs specialist has stricter
+output rules, since a wrong figure does real harm in that domain. Coverage
+is plain retrieval over a broad question space.
+
+Out-of-scope questions are declined at the orchestrator without invoking a
+specialist, which is both correct and cheaper.
+
+**The pattern has a real cost.** Asked a follow-up about HSA contributions —
+content the eligibility specialist had just cited from the handbook — the
+orchestrator classified it as out of scope and declined, where the single
+agent would have searched and found it. Adding a router adds a place to be
+wrong, and the router gates everything downstream. With no conversation
+memory, it also cannot see that a specialist raised the topic a moment
+earlier.
+
+For most questions the single-agent version answers just as well and
+faster. The orchestrator exists to handle the enrollment-date case properly
+and to demonstrate the pattern.
 
 ## Deployment
 
@@ -236,7 +266,8 @@ cross-referenced content, or a second retrieval hop.
 **No conversation memory.** Each request constructs a fresh agent, so
 follow-up questions do not carry context. This is deliberate for a
 multi-user web demo — shared state across users would be worse — but a real
-product needs per-session memory.
+product needs per-session memory, and it is what causes the orchestrator
+routing miss described above.
 
 **No response streaming.** Answers appear all at once after 10-15 seconds.
 Streaming would not reduce total latency but would substantially change how
@@ -259,8 +290,9 @@ uvicorn app:app --reload
 ```
 
 Open http://127.0.0.1:8000. Requires AWS credentials with Bedrock access
-and a knowledge base ID set in `agent.py`. For the LangGraph version,
-`pip install -r requirements-dev.txt` and run `python agent_langgraph.py`.
+and a knowledge base ID set in `agent.py`. For the LangGraph and
+orchestrator versions, `pip install -r requirements-dev.txt` and run
+`python agent_langgraph.py` or `python agent_orchestrator.py`.
 
 ## Notes from the build
 
