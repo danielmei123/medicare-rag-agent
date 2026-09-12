@@ -64,14 +64,16 @@ Bedrock Knowledge Base (managed, 128-page handbook)
 | `agent.py` | The agent: retrieval tool, system prompt, agent construction |
 | `agent_langgraph.py` | The same agent as an explicit LangGraph state graph |
 | `agent_orchestrator.py` | Multi-agent version: orchestrator routing to specialist agents |
-| `app.py` | FastAPI wrapper and the single-page front end |
+| `app.py` | FastAPI wrapper, security headers, and the single-page front end |
 | `lambda_handler.py` | Lambda entry point via Mangum |
 | `Dockerfile` | Lambda container image |
 | `Dockerfile.k8s` | Kubernetes image — plain Python base, serves HTTP directly |
 | `infrastructure.yaml` | CloudFormation: function, role, version, alias, URL, alarms, dashboard |
 | `k8s-deployment.yaml` | Kubernetes Deployment and LoadBalancer Service |
 | `.github/workflows/deploy.yml` | CI/CD: static analysis, evals, build, blue/green deploy |
+| `.github/workflows/dast.yml` | ZAP baseline scan against the deployed endpoint |
 | `evals.py` | Retrieval eval suite, 11 cases |
+| `redteam.py` | Adversarial suite, 10 prompt-injection and guardrail cases |
 | `loadtest.py` | Concurrent load test harness |
 | `test_retrieve.py` | Exercises retrieval alone, without model access |
 
@@ -125,7 +127,8 @@ and to demonstrate the pattern.
 
 ## Deployment
 
-Three paths, all producing the same behaviour.
+Three paths, all producing the same behaviour. Each page shows which one
+served it in a footer, since they are otherwise indistinguishable.
 
 **1. Lambda, via CI/CD.** Push to `main` triggers static analysis
 (`ruff`, `bandit`), then the retrieval evals against the live knowledge
@@ -233,6 +236,51 @@ a production member-facing system the right answer is an Amazon Bedrock
 Guardrail screening input and output independently — a control a compliance
 team can inspect and audit, which a prompt instruction is not.
 
+## Security testing
+
+**Static** analysis runs on every push: `ruff` for lint, `bandit` for common
+Python security issues. Both gate the pipeline.
+
+**Dynamic** analysis runs against the deployed endpoint, manually or weekly
+(`.github/workflows/dast.yml`). A ZAP baseline scan tests the running
+application rather than the source.
+
+The first run found 3 Medium and 6 Low: no Content-Security-Policy, no
+anti-clickjacking header, and a CDN script loaded without a subresource
+integrity hash. FastAPI sets no security headers by default. A middleware
+now sets CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy,
+COOP, CORP and Permissions-Policy, and the `marked` script is pinned to an
+exact version with a SHA-384 integrity hash computed from the published
+npm artifact.
+
+The rescan returned 0 High, 2 Medium, 1 Low. Both remaining Mediums are
+*new*: once a CSP exists, ZAP inspects its contents, and this one permits
+`unsafe-inline` for scripts and styles because the page carries inline
+blocks. That is accepted for a prototype and recorded in `.zap/rules.tsv`
+rather than fixed.
+
+The residual risk there is real, not theoretical. Model output is rendered
+through `marked.parse` into `innerHTML`, so `unsafe-inline` means CSP would
+not block script markup if a response ever contained it. Serving the
+JavaScript and CSS as separate files would remove the exception, and is the
+correct fix.
+
+**Prompt injection** is tested separately by `redteam.py` — 10 adversarial
+cases covering instruction override, role reassignment, hypothetical
+framing, false claims of authority, injection via message content, system
+prompt extraction, incremental escalation, out-of-domain medical urgency,
+and pressure to fabricate figures. All 10 pass.
+
+One case initially failed because the agent *named* the injection attempt
+while refusing it, and the assertion was matching that phrase rather than
+an actual leak. The test now asserts on verbatim fragments of the system
+prompt. Worth noting the behaviour that caused the false positive: the
+agent told the user it had detected an injection attempt, declined it, and
+then answered the legitimate part of the question.
+
+That suite runs on demand rather than in CI — each case costs a model call,
+where the retrieval evals are cheap enough to gate every deploy.
+
 ## Evaluation
 
 `evals.py` runs 11 retrieval cases covering specific figures (the 2026 Part B
@@ -276,6 +324,8 @@ long it feels.
 **Cold starts.** The first request after an idle period takes roughly 8-10
 seconds to initialize the container. Provisioned concurrency would fix this
 at the cost of paying for idle capacity.
+
+**CSP permits inline scripts and styles.** See Security testing above.
 
 **One document.** Only the CMS handbook is indexed. AARP's own Medicare
 Supplement material would be the obvious next source.
@@ -322,6 +372,17 @@ A few things that were not obvious from the documentation:
   `lambda:InvokeFunction` since October 2025.** The console adds both
   automatically; CloudFormation does not. A hand-built function worked
   where the same thing expressed as code returned 403.
+- **Mutable image tags silently prevent deployments.** Pushing new code
+  under the same `:latest` tag left all three deployments serving old
+  containers, each for a different reason: Lambda had pinned a digest at
+  version-publish time, CloudFormation saw no change in the `ImageUri`
+  property so never called `update-function-code`, and Kubernetes reused
+  the node's cached layer under `IfNotPresent`. The CI pipeline avoids this
+  by tagging with the commit SHA; the manual paths did not.
+- **CloudFormation's `AWS::Lambda::Version` is created once and never
+  updated.** An alias pointing at it stays pinned to the original code
+  through every subsequent stack update. SAM's `AutoPublishAlias` exists
+  for this reason.
 
 ## Cost
 

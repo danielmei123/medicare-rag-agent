@@ -1,2 +1,2 @@
-10021	IGNORE	(X-Content-Type-Options missing - single-page demo, no user uploads)
-10063	IGNORE	(Permissions-Policy header missing - no browser features used)
+10055	IGNORE	(CSP unsafe-inline for script-src and style-src. Accepted for the prototype, not for production. The page carries inline script and style blocks; the correct fix is to serve both as separate files and drop the exception. Residual risk is real rather than theoretical: model output is rendered through marked.parse into innerHTML, so script markup in a model response would not be blocked by CSP as configured.)
+90004	IGNORE	(Cross-Origin-Embedder-Policy not set. require-corp would block the CDN-hosted marked.js, which sends no CORP header. Fixing this properly means self-hosting that script. COOP and CORP are both set.)
