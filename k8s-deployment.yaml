@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: medicare-agent
+  labels:
+    app: medicare-agent
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: medicare-agent
+  template:
+    metadata:
+      labels:
+        app: medicare-agent
+    spec:
+      # Bound by IRSA to an IAM role with Bedrock access, so no
+      # credentials are baked into the image or passed as env vars.
+      serviceAccountName: medicare-agent-sa
+      containers:
+        - name: agent
+          image: 676206937758.dkr.ecr.us-east-1.amazonaws.com/medicare-agent:k8s
+          ports:
+            - containerPort: 8080
+          env:
+            - name: AWS_REGION
+              value: us-east-1
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          # /health returns without calling Bedrock, so probes stay cheap.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: medicare-agent
+spec:
+  type: LoadBalancer
+  selector:
+    app: medicare-agent
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
