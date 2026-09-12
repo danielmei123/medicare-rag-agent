@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Compute stack for the Medicare RAG agent. Creates the Lambda function,
+  its execution role, a published version, a "live" alias, and a public
+  function URL. The Bedrock Knowledge Base and the ECR repository are
+  passed in as parameters rather than created here: the knowledge base
+  holds ingested data that should outlive any single stack, and the
+  image must exist in ECR before a container-based function can start.
+
+Parameters:
+
+  FunctionName:
+    Type: String
+    Default: medicare-agent-cfn
+    Description: Name of the Lambda function this stack creates.
+
+  ImageUri:
+    Type: String
+    Description: >
+      Full ECR image URI including tag, e.g.
+      123456789012.dkr.ecr.us-east-1.amazonaws.com/medicare-agent:latest
+
+  KnowledgeBaseId:
+    Type: String
+    Description: ID of the existing Bedrock Knowledge Base to query.
+
+  MemorySize:
+    Type: Number
+    Default: 1024
+    MinValue: 512
+    MaxValue: 3008
+    Description: >
+      Function memory in MB. The default of 128 is not enough to load
+      the agent framework and its dependencies.
+
+  Timeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 300
+    Description: >
+      Function timeout in seconds. The agent makes a retrieval call and
+      one or more model calls, so the Lambda default of 3 always fails.
+
+Resources:
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${FunctionName}-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: bedrock-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Retrieval is scoped to the one knowledge base this agent uses.
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                Resource: !Sub
+                  - "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KbId}"
+                  - KbId: !Ref KnowledgeBaseId
+              # Model invocation needs the inference profile and the
+              # underlying foundation models it routes to, which live in
+              # other regions - hence the wildcard on region.
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+                  - "arn:aws:bedrock:*::foundation-model/*"
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      Role: !GetAtt ExecutionRole.Arn
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref Timeout
+      Environment:
+        Variables:
+          KB_ID: !Ref KnowledgeBaseId
+
+  # Publishing a version freezes the current code so the alias has a
+  # stable target. Blue/green traffic shifting operates on versions,
+  # never on $LATEST.
+  Version:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref Function
+      Description: Initial version created by CloudFormation.
+
+  LiveAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref Function
+      Name: live
+      FunctionVersion: !GetAtt Version.Version
+      Description: >
+        Stable pointer for production traffic. Deployments publish a new
+        version, shift a fraction of traffic to it, then promote it here.
+
+  # The URL is attached to the alias, not the function, so that
+  # deployments can move traffic without the public endpoint changing.
+  FunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref LiveAlias
+      AuthType: NONE
+
+  # Since October 2025, function URLs need both InvokeFunctionUrl and
+  # InvokeFunction. The console adds both automatically; CloudFormation
+  # does not, so a hand-built function works where the template fails.
+  # FunctionUrlAuthType is only valid on the InvokeFunctionUrl action.
+  UrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LiveAlias
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LiveAlias
+      Action: lambda:InvokeFunction
+      Principal: "*"
+
+Outputs:
+
+  FunctionUrl:
+    Description: Public endpoint for the agent.
+    Value: !GetAtt FunctionUrl.FunctionUrl
+
+  FunctionArn:
+    Description: ARN of the created function.
+    Value: !GetAtt Function.Arn
+
+  AliasArn:
+    Description: ARN of the live alias, which deployments target.
+    Value: !Ref LiveAlias
+
+  ExecutionRoleArn:
+    Description: ARN of the function's execution role.
+    Value: !GetAtt ExecutionRole.Arn
