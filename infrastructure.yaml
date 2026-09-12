@@ -95,6 +95,9 @@ Resources:
       Environment:
         Variables:
           KB_ID: !Ref KnowledgeBaseId
+          # Shown in the page footer. The three deployments are otherwise
+          # indistinguishable on screen.
+          DEPLOYMENT: Lambda (CloudFormation)
 
   # Publishing a version freezes the current code so the alias has a
   # stable target. Blue/green traffic shifting operates on versions,
