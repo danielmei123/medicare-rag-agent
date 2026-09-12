@@ -25,6 +25,10 @@ spec:
           env:
             - name: AWS_REGION
               value: us-east-1
+            # Shown in the page footer. The three deployments are
+            # otherwise indistinguishable on screen.
+            - name: DEPLOYMENT
+              value: Kubernetes (EKS)
           resources:
             requests:
               cpu: 200m
