@@ -2,11 +2,12 @@ AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
   Compute stack for the Medicare RAG agent. Creates the Lambda function,
-  its execution role, a published version, a "live" alias, and a public
-  function URL. The Bedrock Knowledge Base and the ECR repository are
-  passed in as parameters rather than created here: the knowledge base
-  holds ingested data that should outlive any single stack, and the
-  image must exist in ECR before a container-based function can start.
+  its execution role, a published version, a "live" alias, a public
+  function URL, and the CloudWatch alarms and dashboard that monitor it.
+  The Bedrock Knowledge Base and the ECR repository are passed in as
+  parameters rather than created here: the knowledge base holds ingested
+  data that should outlive any single stack, and the image must exist in
+  ECR before a container-based function can start.
 
 Parameters:
 
@@ -141,6 +142,108 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: "*"
 
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${FunctionName}-errors"
+      AlarmDescription: Function errors in a five-minute window.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Function
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${FunctionName}-throttles"
+      AlarmDescription: >
+        Requests refused because the account concurrency limit was
+        reached. Load testing showed this begins at roughly 10
+        concurrent requests on the default account limit.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Function
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # p95 rather than average: the average hides cold starts, which are
+  # what a user actually notices.
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${FunctionName}-p95-latency"
+      AlarmDescription: >
+        p95 duration above 25s. Measured baseline is about 15s p95 when
+        warm, about 22s including cold starts.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Function
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref FunctionName
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${Function}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Throttles", ".", "."]
+                ],
+                "period": 300, "stat": "Sum", "region": "${AWS::Region}",
+                "title": "Traffic and failures"
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${Function}", {"stat": "p50"}],
+                  ["...", {"stat": "p95"}],
+                  ["...", {"stat": "Maximum"}]
+                ],
+                "period": 300, "region": "${AWS::Region}",
+                "title": "Latency (ms)"
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "${Function}", {"stat": "Maximum"}]
+                ],
+                "period": 300, "region": "${AWS::Region}",
+                "title": "Concurrent executions"
+              }
+            }
+          ]
+        }
+
 Outputs:
 
   FunctionUrl:
@@ -158,3 +261,7 @@ Outputs:
   ExecutionRoleArn:
     Description: ARN of the function's execution role.
     Value: !GetAtt ExecutionRole.Arn
+
+  DashboardUrl:
+    Description: CloudWatch dashboard for this function.
+    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${FunctionName}"
