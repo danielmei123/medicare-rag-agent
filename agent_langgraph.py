@@ -36,7 +36,7 @@ def search_medicare_handbook(query: str) -> str:
                 "managedSearchConfiguration": {"numberOfResults": 5}
             },
         )
-    except Exception:
+    except bedrock.exceptions.ValidationException:
         # Older botocore versions only accept the vector search shape.
         try:
             response = bedrock.retrieve(
@@ -46,7 +46,7 @@ def search_medicare_handbook(query: str) -> str:
                     "vectorSearchConfiguration": {"numberOfResults": 5}
                 },
             )
-        except Exception as exc:
+        except bedrock.exceptions.ValidationException as exc:
             print(f"RETRIEVE FAILED: {type(exc).__name__}: {exc}")
             return "Handbook search is temporarily unavailable."
 

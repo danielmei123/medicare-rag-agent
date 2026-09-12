@@ -32,7 +32,7 @@ def search_medicare_handbook(query: str) -> str:
                 "managedSearchConfiguration": {"numberOfResults": 5}
             },
         )
-    except Exception as exc:
+    except bedrock.exceptions.ClientError as exc:
         print(f"RETRIEVE FAILED: {type(exc).__name__}: {exc}")
         raise
 
