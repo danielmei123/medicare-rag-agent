@@ -1,4 +1,11 @@
-"""Web wrapper around the Medicare agent."""
+"""Web wrapper around the Medicare agent.
+
+Serves a single-page front end and one /ask endpoint. The same file runs
+locally under uvicorn, on Lambda via Mangum, and in a Kubernetes pod; the
+DEPLOYMENT environment variable is what distinguishes them on screen.
+"""
+
+import os
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -8,6 +15,8 @@ from strands import Agent
 from agent import MODEL_ID, SYSTEM_PROMPT, search_medicare_handbook
 
 app = FastAPI(title="Medicare Assistant")
+
+DEPLOYMENT = os.environ.get("DEPLOYMENT", "Local (uvicorn)")
 
 
 class Question(BaseModel):
@@ -28,7 +37,7 @@ def ask(q: Question):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "deployment": DEPLOYMENT}
 
 
 PAGE = """<!doctype html>
@@ -39,7 +48,7 @@ PAGE = """<!doctype html>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 720px;
-         margin: 40px auto; padding: 0 20px; line-height: 1.6; }
+         margin: 40px auto 80px; padding: 0 20px; line-height: 1.6; }
   h1 { font-size: 1.4rem; margin-bottom: 4px; }
   .sub { color: #666; font-size: 0.9rem; margin-bottom: 24px; }
   textarea { width: 100%; padding: 12px; font-size: 1rem;
@@ -55,6 +64,15 @@ PAGE = """<!doctype html>
   #out th, #out td { border: 1px solid #ddd; padding: 6px 10px;
                      text-align: left; }
   .ex { color: #0b5cad; cursor: pointer; text-decoration: underline; }
+  /* Pinned to the bottom of the viewport so it is visible no matter how
+     long the answer runs - the three deployments look identical
+     otherwise. */
+  .deployment-footer {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    background: #eef3f9; border-top: 1px solid #c5d6e8;
+    padding: 8px 20px; font-size: 0.8rem; color: #24486e;
+    text-align: center; font-weight: 600; letter-spacing: 0.02em;
+  }
 </style>
 </head>
 <body>
@@ -72,6 +90,8 @@ PAGE = """<!doctype html>
 </div>
 
 <div id="out"></div>
+
+<div class="deployment-footer">Serving from: __DEPLOYMENT__</div>
 
 <script>
 function fill(el) { document.getElementById('q').value = el.textContent.trim(); }
@@ -104,4 +124,4 @@ async function ask() {
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return PAGE
+    return PAGE.replace("__DEPLOYMENT__", DEPLOYMENT)
