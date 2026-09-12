@@ -9,6 +9,7 @@ env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: medicare-agent
   LAMBDA_FUNCTION: medicare-agent
+  LIVE_URL: https://q54itqvpoyfyvcjyvwhdpoa3cm0pbcow.lambda-url.us-east-1.on.aws/
 
 permissions:
   id-token: write
@@ -84,7 +85,7 @@ jobs:
           docker push $REGISTRY/$ECR_REPOSITORY:$TAG
           docker push $REGISTRY/$ECR_REPOSITORY:latest
 
-      - name: Update Lambda
+      - name: Update function code
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           TAG: ${{ github.sha }}
@@ -92,3 +93,52 @@ jobs:
           aws lambda update-function-code \
             --function-name $LAMBDA_FUNCTION \
             --image-uri $REGISTRY/$ECR_REPOSITORY:$TAG
+          aws lambda wait function-updated \
+            --function-name $LAMBDA_FUNCTION
+
+      - name: Publish new version
+        id: publish
+        run: |
+          VERSION=$(aws lambda publish-version \
+            --function-name $LAMBDA_FUNCTION \
+            --description "${{ github.sha }}" \
+            --query Version --output text)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Published version $VERSION"
+
+      - name: Shift 10% of traffic to new version
+        env:
+          NEW: ${{ steps.publish.outputs.version }}
+        run: |
+          CURRENT=$(aws lambda get-alias \
+            --function-name $LAMBDA_FUNCTION --name live \
+            --query FunctionVersion --output text)
+          echo "Current version: $CURRENT, new version: $NEW"
+          aws lambda update-alias \
+            --function-name $LAMBDA_FUNCTION \
+            --name live \
+            --function-version $CURRENT \
+            --routing-config "AdditionalVersionWeights={$NEW=0.1}"
+
+      - name: Smoke test the live alias
+        run: |
+          sleep 15
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$LIVE_URL")
+            echo "Request $i: HTTP $STATUS"
+            if [ "$STATUS" != "200" ]; then
+              echo "Smoke test failed - leaving 90% of traffic on the previous version"
+              exit 1
+            fi
+          done
+
+      - name: Promote new version to 100%
+        env:
+          NEW: ${{ steps.publish.outputs.version }}
+        run: |
+          aws lambda update-alias \
+            --function-name $LAMBDA_FUNCTION \
+            --name live \
+            --function-version $NEW \
+            --routing-config "AdditionalVersionWeights={}"
+          echo "Promoted version $NEW to 100% of traffic"
