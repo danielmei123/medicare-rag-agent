@@ -115,29 +115,31 @@ def calculate_enrollment_window(birth_month: int, birth_day: int) -> str:
     def month_name(n: int) -> str:
         return calendar.month_name[((n - 1) % 12) + 1]
 
-    start = anchor - 3
-    end = anchor + 3
-    months = [month_name(m) for m in range(start, end + 1)]
+    months = [month_name(m) for m in range(anchor - 3, anchor + 4)]
 
     early = ", ".join(months[:3])
     late = ", ".join(months[4:])
 
     lines = [
-        f"Initial Enrollment Period: {months[0]} through {months[-1]} "
-        f"(7 months).",
+        (
+            f"Initial Enrollment Period: {months[0]} through "
+            f"{months[-1]} (7 months)."
+        ),
         f"  Three months before: {early}",
         f"  Birthday month: {months[3]}",
         f"  Three months after: {late}",
         "",
         "Coverage start dates:",
-        f"  Signing up in {early} - coverage begins the first day of "
-        f"{months[3]}.",
+        (
+            f"  Signing up in {early} - coverage begins the first day "
+            f"of {months[3]}."
+        ),
     ]
 
     if birth_day == 1:
         lines.append(
-            "  (Birthday on the 1st, so coverage starts the first day of "
-            "the month before the birthday month.)"
+            "  (Birthday on the 1st, so the window shifts one month "
+            "earlier than the birthday month would suggest.)"
         )
 
     lines.append(
@@ -256,7 +258,9 @@ def ask_coverage_specialist(question: str) -> str:
     Args:
         question: The user's question, passed through unchanged.
     """
-    return _run_specialist(COVERAGE_PROMPT, [search_medicare_handbook], question)
+    return _run_specialist(
+        COVERAGE_PROMPT, [search_medicare_handbook], question
+    )
 
 
 SPECIALISTS = [
