@@ -20,6 +20,12 @@ spec:
       containers:
         - name: agent
           image: 676206937758.dkr.ecr.us-east-1.amazonaws.com/medicare-agent:k8s
+          # The default (IfNotPresent) reuses whatever the node already
+          # cached under this tag, so pushing a new image behind the same
+          # tag silently deploys nothing. Always re-pulls. The better fix
+          # for production is an immutable tag - a commit SHA, as the CI
+          # pipeline uses - which makes this setting unnecessary.
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
           env:
