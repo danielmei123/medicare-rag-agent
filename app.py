@@ -3,6 +3,10 @@
 Serves a single-page front end and one /ask endpoint. The same file runs
 locally under uvicorn, on Lambda via Mangum, and in a Kubernetes pod; the
 DEPLOYMENT environment variable is what distinguishes them on screen.
+
+Each response carries its token usage and an estimated cost, because in a
+RAG system the retrieved passages dominate the input and that is the lever
+that actually moves the bill.
 """
 
 import os
@@ -18,6 +22,17 @@ app = FastAPI(title="Medicare Assistant")
 
 DEPLOYMENT = os.environ.get("DEPLOYMENT", "Local (uvicorn)")
 
+# Published on-demand rates for Claude Sonnet on Bedrock, in USD per
+# million tokens. Kept as configuration rather than hardcoded because
+# they change; override with env vars rather than editing code.
+INPUT_USD_PER_MTOK = float(os.environ.get("INPUT_USD_PER_MTOK", "3.00"))
+OUTPUT_USD_PER_MTOK = float(os.environ.get("OUTPUT_USD_PER_MTOK", "15.00"))
+
+# Claude Sonnet's context window. Shown as a percentage so the headroom
+# is visible: a RAG agent that retrieves five passages per call and loops
+# for tool use can grow its context faster than it looks like it should.
+CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", "200000"))
+
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
@@ -26,15 +41,14 @@ async def security_headers(request: Request, call_next):
     FastAPI sets none of these by default. The first DAST run reported
     three Medium findings - no CSP, no anti-clickjacking header, and a
     CDN script without integrity - plus several Low ones for the
-    cross-origin policy headers. This closes all of them except the
-    inline-script allowance noted below.
+    cross-origin policy headers.
     """
     response = await call_next(request)
 
     # 'unsafe-inline' for scripts is a real weakening: the page has an
     # inline <script> block, and a strict policy would break it. Moving
-    # that code to a served file would let this be dropped. Styles are
-    # inline for the same reason.
+    # that code to a served file would let this be dropped. Recorded as
+    # an accepted finding in .zap/rules.tsv.
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
@@ -60,6 +74,61 @@ class Question(BaseModel):
     question: str
 
 
+def _extract_usage(result) -> dict:
+    """Pull token counts out of whatever shape the framework returns.
+
+    Deliberately defensive. Usage lives in different places across
+    framework versions, and losing the answer because the accounting
+    changed shape would be a poor trade. Returns zeros if nothing is
+    found, and the UI hides the panel in that case.
+    """
+    candidates = []
+
+    metrics = getattr(result, "metrics", None)
+    if metrics is not None:
+        candidates.append(getattr(metrics, "accumulated_usage", None))
+        candidates.append(getattr(metrics, "usage", None))
+    candidates.append(getattr(result, "usage", None))
+
+    for usage in candidates:
+        if usage is None:
+            continue
+        if not isinstance(usage, dict):
+            usage = getattr(usage, "__dict__", None)
+        if not isinstance(usage, dict):
+            continue
+
+        # Bedrock uses inputTokens/outputTokens; some wrappers use
+        # snake_case or the OpenAI-style prompt/completion naming.
+        input_tokens = (
+            usage.get("inputTokens")
+            or usage.get("input_tokens")
+            or usage.get("prompt_tokens")
+            or 0
+        )
+        output_tokens = (
+            usage.get("outputTokens")
+            or usage.get("output_tokens")
+            or usage.get("completion_tokens")
+            or 0
+        )
+        if input_tokens or output_tokens:
+            return {
+                "input_tokens": int(input_tokens),
+                "output_tokens": int(output_tokens),
+            }
+
+    return {"input_tokens": 0, "output_tokens": 0}
+
+
+def _cost_usd(input_tokens: int, output_tokens: int) -> float:
+    """Estimated cost of one exchange at the configured rates."""
+    return (
+        input_tokens / 1_000_000 * INPUT_USD_PER_MTOK
+        + output_tokens / 1_000_000 * OUTPUT_USD_PER_MTOK
+    )
+
+
 @app.post("/ask")
 def ask(q: Question):
     # Fresh agent per request - no shared conversation state between users.
@@ -69,7 +138,22 @@ def ask(q: Question):
         tools=[search_medicare_handbook],
     )
     result = agent(q.question)
-    return {"answer": str(result)}
+
+    usage = _extract_usage(result)
+    total = usage["input_tokens"] + usage["output_tokens"]
+
+    return {
+        "answer": str(result),
+        "usage": {
+            **usage,
+            "total_tokens": total,
+            "estimated_cost_usd": round(
+                _cost_usd(usage["input_tokens"], usage["output_tokens"]), 5
+            ),
+            "context_window": CONTEXT_WINDOW,
+            "context_used_pct": round(total / CONTEXT_WINDOW * 100, 2),
+        },
+    }
 
 
 @app.get("/health")
@@ -108,6 +192,10 @@ PAGE = """<!doctype html>
   #out th, #out td { border: 1px solid #ddd; padding: 6px 10px;
                      text-align: left; }
   .ex { color: #0b5cad; cursor: pointer; text-decoration: underline; }
+  #usage { margin-top: 24px; padding: 10px 14px; background: #fafafa;
+           border: 1px solid #e2e2e2; border-radius: 6px;
+           font-size: 0.82rem; color: #555; display: none; }
+  #usage b { color: #24486e; }
   /* Pinned to the bottom of the viewport so it is visible no matter how
      long the answer runs - the three deployments look identical
      otherwise. */
@@ -134,6 +222,7 @@ PAGE = """<!doctype html>
 </div>
 
 <div id="out"></div>
+<div id="usage"></div>
 
 <div class="deployment-footer">Serving from: __DEPLOYMENT__</div>
 
@@ -153,13 +242,29 @@ function render(text) {
   return null;
 }
 
+function showUsage(u, seconds) {
+  const el = document.getElementById('usage');
+  if (!u || !u.total_tokens) { el.style.display = 'none'; return; }
+  el.innerHTML =
+    '<b>' + u.input_tokens.toLocaleString() + '</b> input + ' +
+    '<b>' + u.output_tokens.toLocaleString() + '</b> output = ' +
+    '<b>' + u.total_tokens.toLocaleString() + '</b> tokens &middot; ' +
+    'est. <b>$' + u.estimated_cost_usd.toFixed(5) + '</b> &middot; ' +
+    u.context_used_pct + '% of the ' +
+    (u.context_window / 1000) + 'k context window &middot; ' +
+    seconds.toFixed(1) + 's';
+  el.style.display = 'block';
+}
+
 async function ask() {
   const q = document.getElementById('q').value.trim();
   if (!q) return;
   const btn = document.getElementById('go');
   const out = document.getElementById('out');
   btn.disabled = true;
+  document.getElementById('usage').style.display = 'none';
   out.textContent = 'Searching the handbook...';
+  const started = performance.now();
   try {
     const r = await fetch('/ask', {
       method: 'POST',
@@ -175,6 +280,7 @@ async function ask() {
       out.style.whiteSpace = 'normal';
       out.innerHTML = html;
     }
+    showUsage(data.usage, (performance.now() - started) / 1000);
   } catch (e) {
     out.textContent = 'Error: ' + e;
   }
