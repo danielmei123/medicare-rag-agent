@@ -5,3 +5,5 @@ botocore==1.43.92
 fastapi
 uvicorn
 mangum
+langgraph
+langchain-aws

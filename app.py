@@ -1,8 +1,10 @@
 """Web wrapper around the Medicare agent.
 
-Serves a single-page front end and one /ask endpoint. The same file runs
-locally under uvicorn, on Lambda via Mangum, and in a Kubernetes pod; the
-DEPLOYMENT environment variable is what distinguishes them on screen.
+Serves a single-page front end and two endpoints. /ask runs the single
+Strands agent; /ask-orchestrated routes the question through the
+LangGraph orchestrator to a specialist. The same file runs locally under
+uvicorn, on Lambda via Mangum, and in a Kubernetes pod; the DEPLOYMENT
+environment variable is what distinguishes them on screen.
 
 Each response carries its token usage and an estimated cost, because in a
 RAG system the retrieved passages dominate the input and that is the lever
@@ -13,10 +15,12 @@ import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
+from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 from strands import Agent
 
 from agent import MODEL_ID, SYSTEM_PROMPT, search_medicare_handbook
+from agent_orchestrator import graph as orchestrator_graph
 
 app = FastAPI(title="Medicare Assistant")
 
@@ -129,6 +133,34 @@ def _cost_usd(input_tokens: int, output_tokens: int) -> float:
     )
 
 
+def _text(content) -> str:
+    """Flatten Converse-style content blocks to a plain string.
+
+    LangChain's Bedrock Converse wrapper returns content as a list of
+    blocks rather than a bare string, unlike the Strands path.
+    """
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict)
+        )
+    return str(content)
+
+
+def _usage_payload(input_tokens: int, output_tokens: int) -> dict:
+    """Build the usage block returned alongside every answer."""
+    total = input_tokens + output_tokens
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total,
+        "estimated_cost_usd": round(_cost_usd(input_tokens, output_tokens), 5),
+        "context_window": CONTEXT_WINDOW,
+        "context_used_pct": round(total / CONTEXT_WINDOW * 100, 2),
+    }
+
+
 @app.post("/ask")
 def ask(q: Question):
     # Fresh agent per request - no shared conversation state between users.
@@ -140,19 +172,45 @@ def ask(q: Question):
     result = agent(q.question)
 
     usage = _extract_usage(result)
-    total = usage["input_tokens"] + usage["output_tokens"]
 
     return {
         "answer": str(result),
-        "usage": {
-            **usage,
-            "total_tokens": total,
-            "estimated_cost_usd": round(
-                _cost_usd(usage["input_tokens"], usage["output_tokens"]), 5
-            ),
-            "context_window": CONTEXT_WINDOW,
-            "context_used_pct": round(total / CONTEXT_WINDOW * 100, 2),
-        },
+        "routed_to": [],
+        "usage": _usage_payload(usage["input_tokens"], usage["output_tokens"]),
+    }
+
+
+@app.post("/ask-orchestrated")
+def ask_orchestrated(q: Question):
+    """Route the question through the multi-agent orchestrator.
+
+    Slower than /ask by design: the orchestrator makes its own model call
+    to choose a specialist before the specialist does any work.
+
+    The token counts here cover the orchestrator's own calls only. A
+    specialist runs its loop inside a tool, outside the graph state, so
+    its usage never reaches these messages - the true cost of this path
+    is higher than the figure shown.
+    """
+    result = orchestrator_graph.invoke(
+        {"messages": [HumanMessage(content=q.question)]}
+    )
+    messages = result["messages"]
+
+    routed = []
+    input_tokens = 0
+    output_tokens = 0
+    for message in messages:
+        for call in getattr(message, "tool_calls", None) or []:
+            routed.append(call["name"])
+        usage = getattr(message, "usage_metadata", None) or {}
+        input_tokens += usage.get("input_tokens", 0)
+        output_tokens += usage.get("output_tokens", 0)
+
+    return {
+        "answer": _text(messages[-1].content),
+        "routed_to": routed,
+        "usage": _usage_payload(input_tokens, output_tokens),
     }
 
 
@@ -186,6 +244,7 @@ PAGE = """<!doctype html>
            background: #0b5cad; color: white; border: none;
            border-radius: 6px; cursor: pointer; }
   button:disabled { background: #999; cursor: default; }
+  .mode { margin-left: 14px; font-size: 0.9rem; color: #555; }
   #out { margin-top: 28px; }
   #out h2 { font-size: 1.1rem; margin-top: 24px; }
   #out table { border-collapse: collapse; margin: 12px 0; }
@@ -196,6 +255,7 @@ PAGE = """<!doctype html>
            border: 1px solid #e2e2e2; border-radius: 6px;
            font-size: 0.82rem; color: #555; display: none; }
   #usage b { color: #24486e; }
+  .note { color: #888; }
   /* Pinned to the bottom of the viewport so it is visible no matter how
      long the answer runs - the three deployments look identical
      otherwise. */
@@ -215,7 +275,12 @@ PAGE = """<!doctype html>
 </div>
 
 <textarea id="q" rows="3" placeholder="Ask a Medicare question..."></textarea>
-<button id="go" onclick="ask()">Ask</button>
+<div>
+  <button id="go" onclick="ask()">Ask</button>
+  <label class="mode">
+    <input type="checkbox" id="multi"> Multi-agent orchestration
+  </label>
+</div>
 
 <div class="sub" style="margin-top:16px">
   Try: <span class="ex" onclick="fill(this)">I'm turning 65 in March. What are my enrollment options?</span>
@@ -242,10 +307,10 @@ function render(text) {
   return null;
 }
 
-function showUsage(u, seconds) {
+function showUsage(u, seconds, routed) {
   const el = document.getElementById('usage');
   if (!u || !u.total_tokens) { el.style.display = 'none'; return; }
-  el.innerHTML =
+  let html =
     '<b>' + u.input_tokens.toLocaleString() + '</b> input + ' +
     '<b>' + u.output_tokens.toLocaleString() + '</b> output = ' +
     '<b>' + u.total_tokens.toLocaleString() + '</b> tokens &middot; ' +
@@ -253,6 +318,13 @@ function showUsage(u, seconds) {
     u.context_used_pct + '% of the ' +
     (u.context_window / 1000) + 'k context window &middot; ' +
     seconds.toFixed(1) + 's';
+  if (routed && routed.length) {
+    html = '<b>Routed to:</b> ' + routed.join(', ') +
+           ' <span class="note">(orchestrator tokens only &mdash; ' +
+           'specialist usage runs inside a tool and is not counted)' +
+           '</span><br>' + html;
+  }
+  el.innerHTML = html;
   el.style.display = 'block';
 }
 
@@ -261,12 +333,15 @@ async function ask() {
   if (!q) return;
   const btn = document.getElementById('go');
   const out = document.getElementById('out');
+  const multi = document.getElementById('multi').checked;
   btn.disabled = true;
   document.getElementById('usage').style.display = 'none';
-  out.textContent = 'Searching the handbook...';
+  out.textContent = multi
+    ? 'Routing to a specialist...'
+    : 'Searching the handbook...';
   const started = performance.now();
   try {
-    const r = await fetch('/ask', {
+    const r = await fetch(multi ? '/ask-orchestrated' : '/ask', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({question: q})
@@ -280,7 +355,8 @@ async function ask() {
       out.style.whiteSpace = 'normal';
       out.innerHTML = html;
     }
-    showUsage(data.usage, (performance.now() - started) / 1000);
+    showUsage(data.usage, (performance.now() - started) / 1000,
+              data.routed_to);
   } catch (e) {
     out.textContent = 'Error: ' + e;
   }
